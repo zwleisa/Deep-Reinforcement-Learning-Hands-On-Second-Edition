@@ -1,17 +1,19 @@
 #!/usr/bin/env python
+import cv2
+import time
 import random
 import argparse
-import cv2
+import typing as tt
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 import torchvision.utils as vutils
 
-import gym
-import gym.spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 import numpy as np
 
@@ -39,18 +41,19 @@ class InputWrapper(gym.ObservationWrapper):
     """
     def __init__(self, *args):
         super(InputWrapper, self).__init__(*args)
-        assert isinstance(self.observation_space, gym.spaces.Box)
         old_space = self.observation_space
-        self.observation_space = gym.spaces.Box(
+        assert isinstance(old_space, spaces.Box)
+        self.observation_space = spaces.Box(
             self.observation(old_space.low),
             self.observation(old_space.high),
             dtype=np.float32)
 
-    def observation(self, observation):
+    def observation(self, observation: gym.core.ObsType) -> \
+            gym.core.ObsType:
         # resize image
         new_obs = cv2.resize(
             observation, (IMAGE_SIZE, IMAGE_SIZE))
-        # transform (210, 160, 3) -> (3, 210, 160)
+        # transform (w, h, c) -> (c, w, h)
         new_obs = np.moveaxis(new_obs, 2, 0)
         return new_obs.astype(np.float32)
 
@@ -115,40 +118,44 @@ class Generator(nn.Module):
         return self.pipe(x)
 
 
-def iterate_batches(envs, batch_size=BATCH_SIZE):
-    batch = [e.reset() for e in envs]
+def iterate_batches(
+        envs: tt.List[gym.Env],
+        batch_size: int = BATCH_SIZE
+) -> tt.Generator[torch.Tensor, None, None]:
+    batch = [e.reset()[0] for e in envs]
     env_gen = iter(lambda: random.choice(envs), None)
 
     while True:
         e = next(env_gen)
-        obs, reward, is_done, _ = e.step(e.action_space.sample())
+        action = e.action_space.sample()
+        obs, reward, is_done, is_trunc, _ = e.step(action)     #新版本的gym返回结果数量为5个，增加is_trunc返回值
         if np.mean(obs) > 0.01:
             batch.append(obs)
         if len(batch) == batch_size:
-            # Normalising input between -1 to 1
-            batch_np = np.array(batch, dtype=np.float32) * 2.0 / 255.0 - 1.0
-            yield torch.tensor(batch_np)
+            batch_np = np.array(batch, dtype=np.float32)
+            # Normalising input to [-1..1] and convert to tensor
+            #yield torch.tensor(batch_np * 2.0 / 255.0 - 1.0)
+            yield torch.from_numpy(batch_np * 2.0 / 255.0 - 1.0)      #nupuy直接转tensor会报错
             batch.clear()
-        if is_done:
+        if is_done or is_trunc:
             e.reset()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--cuda", default=False, action='store_true',
-        help="Enable cuda computation")
+    parser.add_argument("--dev", default="cpu",
+                        help="Device name, default=cpu")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device(args.dev)
     envs = [
         InputWrapper(gym.make(name))
-        for name in ('Breakout-v0', 'AirRaid-v0', 'Pong-v0')
+        for name in ('Breakout-v4', 'AirRaid-v4', 'Pong-v4')
     ]
-    input_shape = envs[0].observation_space.shape
+    shape = envs[0].observation_space.shape
 
-    net_discr = Discriminator(input_shape=input_shape).to(device)
-    net_gener = Generator(output_shape=input_shape).to(device)
+    net_discr = Discriminator(input_shape=shape).to(device)
+    net_gener = Generator(output_shape=shape).to(device)
 
     objective = nn.BCELoss()
     gen_optimizer = optim.Adam(
@@ -165,6 +172,7 @@ if __name__ == "__main__":
 
     true_labels_v = torch.ones(BATCH_SIZE, device=device)
     fake_labels_v = torch.zeros(BATCH_SIZE, device=device)
+    ts_start = time.time()
 
     for batch_v in iterate_batches(envs):
         # fake samples, input is 4D: batch, filters, x, y
@@ -195,9 +203,11 @@ if __name__ == "__main__":
 
         iter_no += 1
         if iter_no % REPORT_EVERY_ITER == 0:
-            log.info("Iter %d: gen_loss=%.3e, dis_loss=%.3e",
-                     iter_no, np.mean(gen_losses),
+            dt = time.time() - ts_start
+            log.info("Iter %d in %.2fs: gen_loss=%.3e, dis_loss=%.3e",
+                     iter_no, dt, np.mean(gen_losses),
                      np.mean(dis_losses))
+            ts_start = time.time()
             writer.add_scalar(
                 "gen_loss", np.mean(gen_losses), iter_no)
             writer.add_scalar(
